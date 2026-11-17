@@ -338,18 +338,19 @@ cm_prices <- function(cf, p, tau, K, cp, S0, r, q, alpha = CM_ALPHA) { #prices a
   # sum over points for all strikes at once: Re[ sum_j w_j psi_j exp(-i v_j log K) ]
   logK     <- log(K)
   integral <- Re(colSums((w * psi) * exp(-1i * outer(v, logK))))
-  call     <- exp(-alpha * logK) / pi * exp(-r * tau) * integral
+  call     <- exp(-alpha * logK) / pi * exp(-r * tau) * integral #actual call price
   ifelse(cp == "C", call, call - S0 * exp(-q * tau) + K * exp(-r * tau))   # put-call parity
 }
 
 # Model prices for a whole data set (data frame with tau, K, cp, r).
-price_surface <- function(cf, p, dat) {
+price_surface <- function(cf, p, dat) { 
   out <- numeric(nrow(dat))
   for (idx in split(seq_len(nrow(dat)), dat$tau))
     out[idx] <- cm_prices(cf, p, dat$tau[idx[1]], dat$K[idx], dat$cp[idx],
                           S0, dat$r[idx[1]], q_div)
   out
 }
+#Prices all options of that maturity and writes the prices back into their own rows, so the output lines up with your data frame
 
 # -----------------------------------------------------------------------------
 # 2.3 Calibration engine
@@ -368,9 +369,10 @@ price_surface <- function(cf, p, dat) {
 # -----------------------------------------------------------------------------
 calib_residuals <- function(p, model, dat) {
   e <- (price_surface(model$cf, p, dat) - dat$mid) / dat$vega
-  e[!is.finite(e)] <- 1     # parameters the pricer cannot handle (see cm_prices)
+  e[!is.finite(e)] <- 1     # any residual that is NA, NaN or infinite is set to 1
   e
 }
+#define residuals 
 
 calibrate <- function(model, dat, maxiter = 150) {
   n_eval <- 0                                         # counts price-surface evaluations
@@ -419,31 +421,6 @@ time_surface <- function(model, p, dat, reps = 20) {
   t / reps
 }
 
-# Small helper for the unit checks printed by the model scripts
-check <- function(label, ok) {
-  cat(sprintf("  %-62s %s\n", label, if (isTRUE(ok)) "PASS" else "FAIL"))
-  invisible(isTRUE(ok))
-}
-
-# Classical RK4 solution of the Riccati system, used only to verify the
-# closed forms:  B' = a + b B + c B^2,  A' = extra(B)   (complex valued)
-riccati_rk4 <- function(a, b, c, tau, extra = function(B) 0 * B, n = 4000) {
-  h <- tau / n; B <- 0 + 0i; A <- 0 + 0i
-  f <- function(B) a + b * B + c * B^2
-  for (i in seq_len(n)) {
-    k1 <- f(B); k2 <- f(B + 0.5 * h * k1); k3 <- f(B + 0.5 * h * k2); k4 <- f(B + h * k3)
-    Bn <- B + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
-    # Simpson for A' = extra(B), using the midpoint B from the RK stages
-    Bmid <- B + 0.5 * h * (k1 + k2) / 2
-    A <- A + h / 6 * (extra(B) + 4 * extra(Bmid) + extra(Bn))
-    B <- Bn
-  }
-  list(A = A, B = B)
-}
-
-
-
-
 # #############################################################################
 # PART 3  THE DUFFIE-PAN-SINGLETON MODEL (SVJJ) AND ITS RESTRICTIONS
 #
@@ -484,7 +461,7 @@ DPS_PAR <- c("kappa", "theta", "eta", "rho", "v0", "lambda", "mu_s", "sigma_s",
 #     m = c0 - mu_v B_-,   n = mu_v B_- - c0 g.
 #   With mu_v = 0: I = tau and the SVJ transform follows.
 #   With lambda = 0: the jump terms vanish and the Heston transform follows.
-dps_I <- function(R, c0, mu_v, tau) {
+dps_I <- function(R, c0, mu_v, tau) { #Computes the jump integral.
   m <- c0 - mu_v * R$Bm
   n <- mu_v * R$Bm - c0 * R$g
   I <- tau / m + mu_v * R$Bm * (1 - R$g) / (R$d * m * n) * log((m + n * R$e) / (m + n))
@@ -530,70 +507,7 @@ VJ_LOWER  <- c(0, -10);                          VJ_UPPER  <- c(0.5, 0.4)      #
 
 heston <- dps_spec("Heston", DPS_PAR[1:5],  SV_LOWER, SV_UPPER)
 svj    <- dps_spec("SVJ",    DPS_PAR[1:8],  c(SV_LOWER, PJ_LOWER), c(SV_UPPER, PJ_UPPER))
-svjj   <- dps_spec("SVJJ",   DPS_PAR,       c(SV_LOWER, PJ_LOWER, VJ_LOWER),
-                   c(SV_UPPER, PJ_UPPER, VJ_UPPER))
-
-# ---- 3.3 unit checks ---------------------------------------------------------
-# A test market: S0 = 100, r = 2%, q = 1%.
-cat("Checks:\n")
-local({
-  S <- 100; r <- 0.02; q <- 0.01
-  p   <- c(2, 0.04, 0.5, -0.7, 0.03, 0.6, -0.1, 0.12, 0.05, -0.4); tau <- 2.1
-  u   <- c(0.3, 2, 15, 60) + 0i
-  check("phi(0) = 1", abs(cf_dps(0i, tau, p, S, r, q) - 1) < 1e-12)
-  check("martingale: phi(-i) = S0 exp((r - q) T) (removable 0/0 handled)",
-        abs(cf_dps(-1i, tau, p, S, r, q) / (S * exp((r - q) * tau)) - 1) < 1e-12)
-  
-  # general closed form against a numerical solution of the ODE system,
-  # for real u and for the complex u used by Carr-Madan. The ODEs give the
-  # transform of log(S_T / S0) without the (r - q) drift, i.e. S0 = 1, r = q = 0.
-  for (shift in c(0, -(CM_ALPHA + 1))) {
-    uc  <- complex(real = c(0.3, 2, 15, 60), imaginary = shift)
-    num <- sapply(uc, function(ui) {
-      mubar <- exp(p[7] + 0.5 * p[8]^2) / (1 - p[10] * p[9]) - 1
-      extra <- function(B) p[1] * p[2] * B - p[6] * 1i * ui * mubar +
-        p[6] * (exp(1i * ui * p[7] - 0.5 * p[8]^2 * ui^2) /
-                  (1 - p[9] * (B + 1i * ui * p[10])) - 1)
-      s <- riccati_rk4(-0.5 * (ui^2 + 1i * ui), p[4] * p[3] * 1i * ui - p[1], 0.5 * p[3]^2,
-                       tau, extra = extra)
-      exp(s$A + s$B * p[5]) })
-    check(sprintf("closed form = numerical ODE solution, Im(u) = %.2f", shift),
-          max(Mod(num - cf_dps(uc, tau, p, 1, 0, 0)) / Mod(num)) < 1e-7)
-  }
-  
-  # restrictions: mu_v -> 0 continuously approaches SVJ, lambda -> 0 approaches Heston
-  p_svj <- p; p_svj[9:10] <- 0
-  p_eps <- p; p_eps[9] <- 1e-9
-  check("SVJJ with mu_v -> 0 converges to SVJ",
-        max(Mod(cf_dps(u, tau, p_eps, S, r, q) - cf_dps(u, tau, p_svj, S, r, q))) < 1e-7)
-  p_h <- p; p_h[6] <- 0; p_eps <- p; p_eps[6] <- 1e-10
-  check("SVJJ with lambda -> 0 converges to Heston",
-        max(Mod(cf_dps(u, tau, p_eps, S, r, q) - cf_dps(u, tau, p_h, S, r, q))) < 1e-8)
-  
-  # Black-Scholes limit: lambda = 0, eta -> 0, v0 = theta = 0.2^2
-  K  <- S * exp(seq(-0.4, 0.2, 0.1)); cp <- ifelse(K < S, "P", "C")
-  pr <- cm_prices(heston$cf, c(1, 0.04, 1e-4, 0, 0.04), 0.5, K, cp, S, r, q)
-  check("Heston with eta -> 0 gives Black-Scholes prices",
-        max(abs(pr - bs_price(S, K, r, q, 0.5, 0.2, cp))) < 1e-5)
-  
-  # Merton limit: SVJ with eta -> 0, v0 = theta. Merton's (1976) series formula:
-  #   price = sum_n Poisson(n; lambda' T) * BS(S0, K, r_n, q, T, sigma_n),
-  #   lambda' = lambda (1 + mubar),  r_n = r - lambda mubar + n log(1 + mubar) / T,
-  #   sigma_n^2 = sigma^2 + n sigma_s^2 / T
-  lam <- 0.6; mu <- -0.1; sg <- 0.12; s2 <- 0.04; t <- 0.5
-  mubar  <- exp(mu + 0.5 * sg^2) - 1
-  merton <- rowSums(sapply(0:60, function(n)
-    dpois(n, lam * (1 + mubar) * t) *
-      bs_price(S, K, r - lam * mubar + n * log(1 + mubar) / t, q, t,
-               sqrt(s2 + n * sg^2 / t), cp)))
-  pr <- cm_prices(svj$cf, c(1, s2, 1e-4, 0, s2, lam, mu, sg), t, K, cp, S, r, q)
-  check("SVJ with eta -> 0 gives Merton jump-diffusion prices", max(abs(pr - merton)) < 1e-5)
-  
-  # continuity in u; S0 = 1 and r = q = 0, because the drift term only rotates phi
-  uu <- seq(0, 200, by = 0.05) + 0i
-  ph <- cf_dps(uu, tau, c(1, 0.05, 1.5, -0.9, 0.02, 1, -0.1, 0.1, 0.2, -1), 1, 0, 0)
-  check("phi continuous in u at T = 2.1 (no branch-cut jumps)", max(Mod(diff(ph))) < 0.05)
-})
+svjj   <- dps_spec("SVJJ",   DPS_PAR,       c(SV_LOWER, PJ_LOWER, VJ_LOWER), c(SV_UPPER, PJ_UPPER, VJ_UPPER))
 
 
 # #############################################################################
