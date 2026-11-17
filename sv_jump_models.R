@@ -30,6 +30,7 @@
 library(readxl)       # read the Excel file
 library(ggplot2)      # figures
 library(minpack.lm)   # Levenberg-Marquardt least squares (nls.lm)
+library(statmod)
 
 DATA_FILE <- "Data20191113.xlsx"   # must be in the working directory
 OUT_DIR   <- "output"
@@ -218,14 +219,12 @@ features <- do.call(rbind, lapply(split(opt, opt$tau), function(x) {
 
 
 rownames(features) <- NULL #This line removes those names, so the rows are simply numbered 1 to 12.
-cat("\nSurface features per maturity:\n")
-print(format(features, digits = 3), row.names = FALSE)
-write.csv(features, file.path(OUT_DIR, "surface_features.csv"), row.names = FALSE)
+write.csv(features, file.path(OUT_DIR, "surface_features.csv"), row.names = FALSE) #save it 
 
 p_feat <- ggplot(features, aes(tau, atm_skew)) + geom_line() + geom_point() +
   labs(x = "Maturity (years)", y = "ATM skew  dIV/dk at k = 0",
        title = "Term structure of the ATM skew")
-save_fig(p_feat, "fig02_atm_skew_term_structure", 6, 4)
+save_fig(p_feat, "fig02_atm_skew_term_structure", 6, 4) 
 
 p_atm <- ggplot(features, aes(tau, 100 * atm_iv)) + geom_line() + geom_point() +
   labs(x = "Maturity (years)", y = "ATM implied volatility (%)",
@@ -245,59 +244,30 @@ save_fig(p_atm, "fig03_atm_term_structure", 6, 4)
 #   want to extrapolate in maturity.
 # -----------------------------------------------------------------------------
 HOLDOUT_EXDATES <- as.Date(c("2020-01-17", "2020-09-18"))
-TEST_FRACTION   <- 0.20
+TEST_FRACTION   <- 0.20 #The share of quotes held out within each of the other maturities: 20%.
 
-opt$sample <- "train"
-opt$sample[opt$exdate %in% HOLDOUT_EXDATES] <- "test_maturity"
+opt$sample <- "train" #create a new row and sets it to “train” for every quote
+opt$sample[opt$exdate %in% HOLDOUT_EXDATES] <- "test_maturity" #every quote with one of the two held-out expiries gets the label “test_maturity”
+
 for (t in unique(opt$tau[opt$sample == "train"])) {
   idx <- which(opt$tau == t)
   opt$sample[sample(idx, round(TEST_FRACTION * length(idx)))] <- "test_strike"
-}
-train <- opt[opt$sample == "train", ]
-cat("\nSample sizes:\n"); print(table(opt$sample))
-print(table(format(opt$exdate), opt$sample))
-saveRDS(opt, file.path(OUT_DIR, "options_clean.rds"))
+} #pick 20% of that maturity’s quotes at random (36 of December’s 179) and label them “test_strike”.
+train <- opt[opt$sample == "train", ] #a table with only the training quotes, about 1,030.
+saveRDS(opt, file.path(OUT_DIR, "options_clean.rds")) #The .rds format keeps dates as dates and numbers as numbers.
 write.csv(opt, file.path(OUT_DIR, "options_clean.csv"), row.names = FALSE)
 
 
 # #############################################################################
 # PART 2  PRICING AND CALIBRATION TOOLS (shared by all three specifications)
 #
-#   2.1 Gauss-Legendre quadrature
 #   2.2 The Riccati solver ("the machine")
 #   2.3 Carr-Madan pricer
 #   2.4 Calibration engine
 #   2.5 Evaluation helpers
 # #############################################################################
-
 # -----------------------------------------------------------------------------
-# 2.1 Gauss-Legendre quadrature (Golub-Welsch, no extra package needed)
-# -----------------------------------------------------------------------------
-
-# Nodes and weights on [-1, 1]
-gauss_legendre <- function(n) {
-  i <- seq_len(n - 1)
-  b <- i / sqrt(4 * i^2 - 1)
-  J <- matrix(0, n, n)
-  J[cbind(i, i + 1)] <- b
-  J[cbind(i + 1, i)] <- b
-  e <- eigen(J, symmetric = TRUE)
-  o <- order(e$values)
-  list(x = e$values[o], w = 2 * e$vectors[1, o]^2)
-}
-
-GL16 <- gauss_legendre(16)
-
-# Composite rule: n_panels panels of equal width on [0, upper], 16 nodes each
-composite_gl <- function(upper, n_panels) {
-  h    <- upper / n_panels
-  left <- (seq_len(n_panels) - 1) * h
-  list(v = as.vector(outer(0.5 * h * (GL16$x + 1), left, "+")),
-       w = rep(0.5 * h * GL16$w, times = n_panels))
-}
-
-# -----------------------------------------------------------------------------
-# 2.2 The machine: closed-form solution of the Riccati equation
+# 2.1 The machine: closed-form solution of the Riccati equation
 #
 #       B'(tau) = a + b B + c B^2,      B(0) = 0
 #
@@ -320,8 +290,10 @@ riccati <- function(a, b, c, tau) {
   list(B = B, intB = intB, d = d, g = g, Bm = Bm, e = e)
 }
 
+#define the riccarti equation (Its the same for all)
+
 # -----------------------------------------------------------------------------
-# 2.3 Carr-Madan pricer
+# 2.2 Carr-Madan pricer
 #
 #    C(K) = exp(-alpha log K) / pi * exp(-r T) * int_0^inf Re[ exp(-iv log K) psi(v) ] dv,
 #    psi(v) = phi(v - (alpha+1) i) / (alpha^2 + alpha - v^2 + i (2 alpha + 1) v),
@@ -332,32 +304,40 @@ riccati <- function(a, b, c, tau) {
 #    upper limit is chosen adaptively from the decay of |phi|, because short
 #    maturities need a much longer integration range than long ones.
 # -----------------------------------------------------------------------------
-CM_ALPHA <- 1.25     # damping parameter
-CM_TOL   <- 1e-9     # truncation tolerance (relative to E[S_T^(alpha+1)])
+CM_ALPHA <- 1.25     # damping parameter(value Carr and Madan themselves suggest)
+CM_TOL   <- 1e-9     # truncation tolerance, how small the remaining tail of the integral must be before you stop integrating.
 CM_PANEL <- 10       # panel width in v (16 nodes per panel)
 
-# OTM option prices for ONE maturity, in index points.
-#   cf : function(u, tau, p, S0, r, q) -> characteristic function of log(S_T)
-#   K, cp : strikes and "C"/"P";  S0, r, q : spot, rate and dividend yield
-cm_prices <- function(cf, p, tau, K, cp, S0, r, q, alpha = CM_ALPHA) {
+
+cm_prices <- function(cf, p, tau, K, cp, S0, r, q, alpha = CM_ALPHA) { #prices all options of one maturity at once.
   # Carr-Madan needs E[S_T^(alpha+1)] = phi(-(alpha+1) i) to be finite. The
   # optimiser can try parameters where it is not; the prices are then NA.
   m <- cf(complex(real = 0, imaginary = -(alpha + 1)), tau, p, S0, r, q)
   if (!is.finite(Re(m)) || Re(m) <= 0) return(rep(NA_real_, length(K)))
+  #check if model explodes
   
   # upper limit: first candidate where the tail bound |phi|/v is negligible
-  cand  <- 25 * 2^(0:8)                                  # 25, 50, ..., 6400
+  cand  <- 25 * 2^(0:8)                                  # 25, 50, ..., 6400 chooses where to cut off the integral
   mag   <- Mod(cf(complex(real = cand, imaginary = -(alpha + 1)), tau, p, S0, r, q)) /
     (Re(m) * cand)
   upper <- cand[min(which(mag < CM_TOL), length(cand))]
+  #evaluate the integral at different candiates, when the tolarance is over stop, otherwise use the biggest one
   
-  gl  <- composite_gl(upper, ceiling(upper / CM_PANEL))
-  u   <- complex(real = gl$v, imaginary = -(alpha + 1))
-  psi <- cf(u, tau, p, S0, r, q) / (alpha^2 + alpha - gl$v^2 + 1i * (2 * alpha + 1) * gl$v)
+  # uilds the integration grid with composite Gauss–Legendre quadrature.
+  gl   <- gauss.quad(16, kind = "legendre")                 # points and weights on [-1, 1]
+  n    <- ceiling(upper / CM_PANEL)                         # number of panels
+  h    <- upper / n                                         # panel width
+  left <- (0:(n - 1)) * h                                   # left edge of each panel
+  v    <- as.vector(outer(h / 2 * (gl$nodes + 1), left, "+")) 
+  w    <- rep(h / 2 * gl$weights, times = n)
   
-  # sum over nodes for all strikes at once: Re[ sum_j w_j psi_j exp(-i v_j log K) ]
+  #evaluates the strike-independent part of the integrand at every grid point
+  u   <- complex(real = v, imaginary = -(alpha + 1))
+  psi <- cf(u, tau, p, S0, r, q) / (alpha^2 + alpha - v^2 + 1i * (2 * alpha + 1) * v)
+  
+  # sum over points for all strikes at once: Re[ sum_j w_j psi_j exp(-i v_j log K) ]
   logK     <- log(K)
-  integral <- Re(colSums((gl$w * psi) * exp(-1i * outer(gl$v, logK))))
+  integral <- Re(colSums((w * psi) * exp(-1i * outer(v, logK))))
   call     <- exp(-alpha * logK) / pi * exp(-r * tau) * integral
   ifelse(cp == "C", call, call - S0 * exp(-q * tau) + K * exp(-r * tau))   # put-call parity
 }
@@ -372,7 +352,7 @@ price_surface <- function(cf, p, dat) {
 }
 
 # -----------------------------------------------------------------------------
-# 2.4 Calibration engine
+# 2.3 Calibration engine
 #
 #    Objective: sum of squared VEGA-WEIGHTED price errors,
 #        e_i = (P_model,i - P_market,i) / vega_market,i
@@ -418,7 +398,7 @@ calibrate <- function(model, dat, maxiter = 150) {
 }
 
 # -----------------------------------------------------------------------------
-# 2.5 Evaluation
+# 2.4 Evaluation
 # -----------------------------------------------------------------------------
 
 # Adds model price, model implied vol and IV error (in vol points) to dat
@@ -617,14 +597,12 @@ local({
 
 
 # #############################################################################
-# PART 4  NUMERICAL ILLUSTRATIONS (illustrative parameters, no data used)
+# PART 4  MONTE CARLO VALIDATION (illustrative parameters, no data used)
 #
-#   4.1 Why the "little Heston trap" form of the transform is needed
-#   4.2 Accuracy of the Carr-Madan pricer: damping alpha and truncation
-#   4.3 Monte Carlo validation of the transform, for all three specifications
-#   4.4 What each extra piece does to the smile and to the skew term structure
+#   The Fourier prices of all three specifications are compared with prices
+#   from an independent Monte Carlo simulation of the model.
 # #############################################################################
-cat("\n================ PART 4: NUMERICAL ILLUSTRATIONS ================\n")
+cat("\n================ PART 4: MONTE CARLO VALIDATION ================\n")
 
 # Illustrative market: spot 100, rate 2%, dividend yield 1%.
 S0_ILL <- 100; R_ILL <- 0.02; Q_ILL <- 0.01
@@ -640,91 +618,13 @@ ILL_SETS <- list(Heston = P_ILL_HESTON, SVJ = P_ILL_SVJ, SVJJ = P_ILL)
 
 spec_colours <- c(Heston = "#1b9e77", SVJ = "#d95f02", SVJJ = "#7570b3")
 
-# Temporarily change the pricer's quadrature settings
-with_cm <- function(tol, panel, expr) {
-  old <- c(CM_TOL, CM_PANEL)
-  CM_TOL <<- tol; CM_PANEL <<- panel
-  on.exit({ CM_TOL <<- old[1]; CM_PANEL <<- old[2] })
-  expr
-}
 # strike grid that scales with maturity: K = S0 * exp(z * 0.2 * sqrt(tau))
 strike_grid <- function(tau, z = seq(-4, 1.5, by = 0.25)) S0_ILL * exp(z * 0.2 * sqrt(tau))
 # Model prices and implied vols in the illustrative market
 ill_prices <- function(p, tau, K, cp, ...) cm_prices(svjj$cf, p, tau, K, cp, S0_ILL, R_ILL, Q_ILL, ...)
 ill_iv     <- function(price, tau, K, cp) implied_vol(price, S0_ILL, K, R_ILL, Q_ILL, tau, cp)
 
-# ---- 4.1 the branch cut ------------------------------------------------------
-# Heston's original formula uses g = B_+/B_- and exp(+d tau). The complex log in
-# the A-term then crosses its branch cut for long maturities and large eta, and
-# phi jumps. The formulation in riccati() (Albrecher et al., 2007) does not.
-# S0 = 1 and r = q = 0 here: the drift term only rotates phi and has nothing to
-# do with the branch cut.
-local({
-  p <- c(kappa = 1, theta = 0.05, eta = 1.5, rho = -0.9, v0 = 0.02); tau <- 5
-  u <- seq(0.01, 30, by = 0.01) + 0i
-  a <- -0.5 * (u^2 + 1i * u); b <- p[["rho"]] * p[["eta"]] * 1i * u - p[["kappa"]]
-  c <- 0.5 * p[["eta"]]^2
-  d <- sqrt(b^2 - 4 * a * c); Bp <- (-b + d) / (2 * c); G <- (-b + d) / (-b - d)
-  e <- exp(d * tau)
-  orig <- exp(p[["kappa"]] * p[["theta"]] * (Bp * tau - log((1 - G * e) / (1 - G)) / c) +
-                Bp * (1 - e) / (1 - G * e) * p[["v0"]])
-  trap <- heston$cf(u, tau, unname(p), 1, 0, 0)
-  df <- rbind(data.frame(u = Re(u), re = Re(orig), form = "Original Heston (1993) form"),
-              data.frame(u = Re(u), re = Re(trap), form = "Form used here (Albrecher et al., 2007)"))
-  g <- ggplot(df, aes(u, re, colour = form)) + geom_line() +
-    scale_colour_manual(values = c("#b2182b", "black"), name = NULL) +
-    labs(x = "u", y = expression(Re~phi(u)),
-         title = "Heston characteristic function, T = 5, eta = 1.5: the branch-cut jump") +
-    theme(legend.position = "bottom")
-  save_fig(g, "fig_n1_branch_cut", 7.5, 4)
-  cat(sprintf("4.1 Largest jump in phi between grid points: original %.3f, used here %.5f\n",
-              max(Mod(diff(orig))), max(Mod(diff(trap)))))
-})
-
-# ---- 4.2 pricer accuracy -----------------------------------------------------
-# Reference prices: very fine quadrature and very long integration range.
-# Errors are reported in implied-vol points, the unit used in the calibration.
-pricer_accuracy <- local({
-  taus <- c(0.1, 1, 2.1)
-  ref <- lapply(taus, function(t) {
-    K <- strike_grid(t); cp <- ifelse(K < S0_ILL, "P", "C")
-    pr <- with_cm(1e-15, 2, ill_prices(P_ILL, t, K, cp))
-    list(K = K, cp = cp, iv = ill_iv(pr, t, K, cp))
-  })
-  # the reference does not depend on alpha: check it against alpha = 0.75
-  ref2 <- sapply(seq_along(taus), function(j) {
-    r <- ref[[j]]; pr <- with_cm(1e-15, 2, ill_prices(P_ILL, taus[j], r$K, r$cp, alpha = 0.75))
-    max(abs(ill_iv(pr, taus[j], r$K, r$cp) - r$iv)) })
-  cat(sprintf("4.2 Reference prices with alpha = 1.25 vs 0.75: max IV difference %.1e vol pts\n",
-              100 * max(ref2)))
-  
-  grid <- expand.grid(alpha = c(0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 5),
-                      tol = c(1e-5, 1e-7, 1e-9, 1e-11), tau = taus)
-  grid$max_iv_err <- NA
-  for (i in seq_len(nrow(grid))) {
-    j <- match(grid$tau[i], taus); r <- ref[[j]]
-    pr <- with_cm(grid$tol[i], CM_PANEL,
-                  ill_prices(P_ILL, grid$tau[i], r$K, r$cp, alpha = grid$alpha[i]))
-    if (anyNA(pr)) next     # E[S^(alpha+1)] infinite: this alpha cannot be used
-    grid$max_iv_err[i] <- 100 * max(abs(ill_iv(pr, grid$tau[i], r$K, r$cp) - r$iv))
-  }
-  grid
-})
-write.csv(pricer_accuracy, file.path(OUT_DIR, "table_pricer_accuracy.csv"), row.names = FALSE)
-g <- ggplot(pricer_accuracy[!is.na(pricer_accuracy$max_iv_err), ],
-            aes(alpha, pmax(max_iv_err, 1e-9), colour = factor(tol))) +
-  geom_line() + geom_point(size = 1) + facet_wrap(~ paste("T =", tau)) +
-  scale_y_log10() + scale_x_log10(breaks = c(0.25, 0.5, 1, 2, 5)) +
-  geom_vline(xintercept = CM_ALPHA, linetype = 2, colour = "grey50") +
-  labs(x = expression("Damping parameter "*alpha), y = "Max IV error (vol points, log scale)",
-       colour = "Truncation\ntolerance",
-       title = "Carr-Madan pricer: accuracy against damping and truncation (SVJJ)")
-save_fig(g, "fig_n2_pricer_accuracy", 9, 4)
-cat("    Max IV error (vol pts) at the settings used, alpha = 1.25, tol = 1e-9:\n")
-print(pricer_accuracy[pricer_accuracy$alpha == CM_ALPHA & pricer_accuracy$tol == CM_TOL,
-                      c("tau", "max_iv_err")], row.names = FALSE)
-
-# ---- 4.3 Monte Carlo validation ----------------------------------------------
+# ---- Monte Carlo validation --------------------------------------------------
 # Euler discretisation as in the lecture code (MCCallHeston.m):
 #   two independent standard normals phi1, phi2 per step,
 #     dW1 = sqrt(dt) * phi1                              (drives the log-price)
@@ -783,10 +683,13 @@ mc_validation <- cached("mc_validation_euler_spot", local({
 }))
 mc_validation$model <- factor(mc_validation$model, levels = names(ILL_SETS))
 write.csv(mc_validation, file.path(OUT_DIR, "table_mc_validation.csv"), row.names = FALSE)
-cat("4.3 Monte Carlo vs Fourier (200,000 paths per maturity):\n")
-print(aggregate(cbind(max_abs_z = abs(z_score), max_iv_diff_volpts = 100 * abs(iv_mc - iv_fourier),
-                      martingale_minus_1 = martingale - 1) ~ model + tau, mc_validation, max),
-      digits = 3, row.names = FALSE)
+cat("Monte Carlo vs Fourier (200,000 paths per maturity):\n")
+mc_summary <- mc_validation |>
+  group_by(model, tau) |>
+  summarise(max_abs_z          = max(abs(z_score)),
+            max_iv_diff_volpts = max(100 * abs(iv_mc - iv_fourier)),
+            martingale_minus_1 = max(martingale - 1), .groups = "drop")
+print(as.data.frame(mc_summary), digits = 3, row.names = FALSE)
 
 g <- ggplot(mc_validation, aes(k, 100 * iv_fourier)) +
   geom_line(aes(colour = model)) +
@@ -796,50 +699,7 @@ g <- ggplot(mc_validation, aes(k, 100 * iv_fourier)) +
   scale_colour_manual(values = spec_colours, guide = "none") +
   labs(x = "Log-moneyness k = log(K/S0)", y = "Implied volatility (%)",
        title = "Fourier prices (lines) against Monte Carlo with 95% intervals (points)")
-save_fig(g, "fig_n3_mc_validation", 9, 6.5)
-
-# ---- 4.4 what each extra piece does ------------------------------------------
-# Start from Heston, add price jumps (SVJ), then variance jumps (SVJJ). To
-# compare shapes and not levels, theta and v0 are lowered so that the expected
-# annual variance from all sources stays (approximately) the same:
-#   price jumps add  lambda * E[(Z^s)^2],
-#   variance jumps raise the long-run mean of V by lambda * mu_v / kappa.
-jump_var <- function(p) with(as.list(p),
-                             lambda * (sigma_s^2 + mu_s^2 + 2 * mu_s * rho_J * mu_v + 2 * rho_J^2 * mu_v^2))
-matched <- lapply(ILL_SETS, function(p) {
-  J <- jump_var(p); p["v0"] <- P_ILL[["v0"]] - J
-  p["theta"] <- P_ILL[["theta"]] - J - p[["lambda"]] * p[["mu_v"]] / p[["kappa"]]
-  p })
-cat("4.4 Variance-matched parameter sets (theta, v0):\n")
-print(round(sapply(matched, function(p) p[c("theta", "v0")]), 4))
-
-smile_df <- do.call(rbind, lapply(names(matched), function(m) do.call(rbind, lapply(c(0.1, 1),
-                                                                                    function(t) {
-                                                                                      K <- strike_grid(t, z = seq(-3, 1.5, by = 0.1)); cp <- ifelse(K < S0_ILL, "P", "C")
-                                                                                      pr <- ill_prices(unname(matched[[m]]), t, K, cp)
-                                                                                      data.frame(model = m, tau = t, k = log(K / S0_ILL), iv = ill_iv(pr, t, K, cp)) }))))
-smile_df$model <- factor(smile_df$model, levels = names(matched))
-g1 <- ggplot(smile_df, aes(k, 100 * iv, colour = model)) + geom_line(linewidth = 0.7) +
-  facet_wrap(~ paste("T =", tau), scales = "free") +
-  scale_colour_manual(values = spec_colours, name = NULL) +
-  labs(x = "Log-moneyness k = log(K/S0)", y = "Implied volatility (%)",
-       title = "Adding price jumps, then variance jumps (variance-matched)")
-save_fig(g1, "fig_n4_smiles_by_component", 9, 4)
-
-skew_ill <- do.call(rbind, lapply(names(matched), function(m) {
-  tg <- exp(seq(log(1 / 52), log(3), length.out = 40))
-  K  <- S0_ILL * exp(c(-SKEW_H, SKEW_H))
-  data.frame(model = m, tau = tg, skew = sapply(tg, function(t) {
-    pr <- ill_prices(unname(matched[[m]]), t, K, c("P", "C"))
-    iv <- ill_iv(pr, t, K, c("P", "C")); (iv[2] - iv[1]) / (2 * SKEW_H) })) }))
-skew_ill$model <- factor(skew_ill$model, levels = names(matched))
-g2 <- ggplot(skew_ill, aes(tau, skew, colour = model)) + geom_line(linewidth = 0.7) +
-  scale_x_log10(breaks = c(0.02, 0.05, 0.1, 0.25, 0.5, 1, 2)) +
-  scale_colour_manual(values = spec_colours, name = NULL) +
-  labs(x = "Maturity (years, log scale)", y = "ATM skew  dIV/dk at k = 0",
-       title = "ATM skew term structure by component (variance-matched)")
-save_fig(g2, "fig_n5_skew_by_component", 7.5, 4.5)
-
+save_fig(g, "fig_mc_validation", 9, 6.5)
 
 # #############################################################################
 # PART 5  CALIBRATION TO THE SPX SURFACE
@@ -916,9 +776,8 @@ for (r in list(res_heston, res_svj, res_svjj)) {
 #   6.4 Where do the models fail? Errors by maturity and by moneyness
 #   6.5 Heatmaps of implied-vol errors (maturity x moneyness)
 #   6.6 Fitted smiles
-#   6.7 What does each extra piece buy?
-#   6.8 The mechanism: model-implied ATM skew term structure
-#   6.9 Parameter distortion in Heston
+#   6.7 The mechanism: model-implied ATM skew term structure
+#   6.8 Parameter distortion in Heston
 # #############################################################################
 cat("\n================ PART 6: COMPARISON ================\n")
 
@@ -941,21 +800,23 @@ model_colours <- spec_colours
 # IV-RMSE in volatility points. "sec_per_surface" is the time for one
 # evaluation of all training prices; "time_best_start" is the time of the
 # single optimiser run that found the optimum.
-summary_tab <- do.call(rbind, lapply(model_levels, function(m) {
-  r <- res[res$model == m, ]; f <- FITS[[m]]
-  data.frame(model = m, n_par = f$n_par,
-             rmse_train         = rmse(r$iv_err[r$sample == "train"]),
-             rmse_test_strike   = rmse(r$iv_err[r$sample == "test_strike"]),
-             rmse_test_maturity = rmse(r$iv_err[r$sample == "test_maturity"]),
-             mae_all            = mean(abs(r$iv_err)),
-             bias_all           = mean(r$iv_err),
-             n_starts           = length(f$runs),
-             time_total_sec     = f$time_total, n_eval_total = f$n_eval_total,
-             time_best_start    = f$time_best,  n_eval_best  = f$n_eval_best,
-             sec_per_surface    = time_surface(MODELS[[m]], f$par, train))
-}))
+summary_tab <- res |>
+  group_by(model) |>
+  summarise(rmse_train         = rmse(iv_err[sample == "train"]),
+            rmse_test_strike   = rmse(iv_err[sample == "test_strike"]),
+            rmse_test_maturity = rmse(iv_err[sample == "test_maturity"]),
+            mae_all            = mean(abs(iv_err)),
+            bias_all           = mean(iv_err))
+# calibration information, in the same model order (Heston, SVJ, SVJJ)
+summary_tab$n_par           <- sapply(FITS, function(f) f$n_par)
+summary_tab$n_starts        <- sapply(FITS, function(f) length(f$runs))
+summary_tab$time_total_sec  <- sapply(FITS, function(f) f$time_total)
+summary_tab$n_eval_total    <- sapply(FITS, function(f) f$n_eval_total)
+summary_tab$time_best_start <- sapply(FITS, function(f) f$time_best)
+summary_tab$n_eval_best     <- sapply(FITS, function(f) f$n_eval_best)
+summary_tab$sec_per_surface <- sapply(model_levels, function(m) time_surface(MODELS[[m]], FITS[[m]]$par, train))
 cat("\nFit (IV-RMSE in vol points) and calibration speed:\n")
-print(format(summary_tab, digits = 3), row.names = FALSE)
+print(as.data.frame(summary_tab), digits = 3, row.names = FALSE)
 write.csv(summary_tab, file.path(OUT_DIR, "table_summary.csv"), row.names = FALSE)
 
 # ---- 6.3 parameters ----------------------------------------------------------
@@ -968,13 +829,14 @@ cat("\nCalibrated parameters:\n"); print(format(par_tab, digits = 4), row.names 
 write.csv(par_tab, file.path(OUT_DIR, "table_parameters.csv"), row.names = FALSE)
 
 # ---- 6.4 errors by maturity and by moneyness ---------------------------------
-by_mat <- aggregate(iv_err ~ model + tau + exdate, res, rmse)
-by_mat$holdout <- by_mat$exdate %in% HOLDOUT_EXDATES
+by_mat <- res |>
+  group_by(model, tau, exdate) |>
+  summarise(iv_err = rmse(iv_err), .groups = "drop") |>
+  mutate(holdout = exdate %in% HOLDOUT_EXDATES)
+by_mat_wide <- pivot_wider(by_mat, id_cols = tau, names_from = model, values_from = iv_err)
 cat("\nIV-RMSE by maturity (vol points):\n")
-print(round(tapply(res$iv_err, list(sprintf("%.2f", res$tau), res$model), rmse), 3))
-write.csv(reshape(by_mat[, c("model", "tau", "iv_err")], idvar = "tau", timevar = "model",
-                  direction = "wide"), file.path(OUT_DIR, "table_rmse_by_maturity.csv"),
-          row.names = FALSE)
+print(as.data.frame(by_mat_wide), digits = 3, row.names = FALSE)
+write.csv(by_mat_wide, file.path(OUT_DIR, "table_rmse_by_maturity.csv"), row.names = FALSE)
 
 p_mat <- ggplot(by_mat, aes(tau, iv_err, colour = model)) +
   geom_line() + geom_point(aes(shape = holdout), size = 2) +
@@ -986,11 +848,13 @@ p_mat <- ggplot(by_mat, aes(tau, iv_err, colour = model)) +
        title = "Implied-volatility error by maturity")
 save_fig(p_mat, "fig04_rmse_by_maturity", 7.5, 4.5)
 
-by_mny <- aggregate(iv_err ~ model + mny_bucket, res, rmse)
+by_mny <- res |>
+  group_by(model, mny_bucket) |>
+  summarise(iv_err = rmse(iv_err), .groups = "drop")
+by_mny_wide <- pivot_wider(by_mny, names_from = model, values_from = iv_err)
 cat("\nIV-RMSE by moneyness bucket (vol points):\n")
-print(round(tapply(res$iv_err, list(res$mny_bucket, res$model), rmse), 3))
-write.csv(reshape(by_mny, idvar = "mny_bucket", timevar = "model", direction = "wide"),
-          file.path(OUT_DIR, "table_rmse_by_moneyness.csv"), row.names = FALSE)
+print(as.data.frame(by_mny_wide), digits = 3, row.names = FALSE)
+write.csv(by_mny_wide, file.path(OUT_DIR, "table_rmse_by_moneyness.csv"), row.names = FALSE)
 
 p_mny <- ggplot(by_mny, aes(mny_bucket, iv_err, fill = model)) +
   geom_col(position = "dodge") +
@@ -1000,9 +864,9 @@ p_mny <- ggplot(by_mny, aes(mny_bucket, iv_err, fill = model)) +
 save_fig(p_mny, "fig05_rmse_by_moneyness", 7.5, 4.5)
 
 # ---- 6.5 heatmaps: maturity x moneyness --------------------------------------
-heat <- aggregate(iv_err ~ model + mat_short + mny_bucket, res,
-                  function(e) c(bias = mean(e), rmse = rmse(e), n = length(e)))
-heat <- cbind(heat[, 1:3], as.data.frame(heat$iv_err))
+heat <- res |>
+  group_by(model, mat_short, mny_bucket) |>
+  summarise(bias = mean(iv_err), rmse = rmse(iv_err), n = n(), .groups = "drop")
 
 lim <- max(abs(heat$bias))
 p_heat_bias <- ggplot(heat, aes(mny_bucket, mat_short, fill = bias)) +
@@ -1052,28 +916,7 @@ p_short <- ggplot() +
        title = "The short end of the surface") + theme(legend.position = "bottom")
 save_fig(p_short, "fig09_short_end_smiles", 9, 4.5)
 
-# ---- 6.7 what does each extra piece buy? -------------------------------------
-res$mat_group <- cut(res$tau, c(0, SHORT_MAX, LONG_MIN, Inf), right = FALSE,
-                     labels = c(sprintf("short (T < %.2f)", SHORT_MAX), "medium",
-                                sprintf("long (T >= %.2f)", LONG_MIN)))
-res$wing <- cut(res$k, c(-Inf, -0.10, 0.0, Inf),
-                labels = c("OTM puts (k < -0.10)", "near-ATM puts", "OTM calls"))
-buy <- tapply(res$iv_err, list(paste(res$mat_group, "|", res$wing), res$model), rmse)
-buy <- cbind(buy,
-             `SVJ vs Heston (%)`  = 100 * (buy[, "SVJ"]  / buy[, "Heston"] - 1),
-             `SVJJ vs SVJ (%)`    = 100 * (buy[, "SVJJ"] / buy[, "SVJ"]    - 1),
-             `SVJJ vs Heston (%)` = 100 * (buy[, "SVJJ"] / buy[, "Heston"] - 1))
-cat("\nIV-RMSE by region, and the change from each extension:\n"); print(round(buy, 3))
-write.csv(buy, file.path(OUT_DIR, "table_what_each_piece_buys.csv"))
-
-grp <- aggregate(iv_err ~ model + mat_group + wing, res, rmse)
-p_buy <- ggplot(grp, aes(wing, iv_err, fill = model)) + geom_col(position = "dodge") +
-  facet_wrap(~mat_group) + scale_fill_manual(values = model_colours, name = NULL) +
-  labs(x = NULL, y = "IV-RMSE (vol points)", title = "Where each model gains or loses") +
-  theme(axis.text.x = element_text(angle = 25, hjust = 1), legend.position = "bottom")
-save_fig(p_buy, "fig10_what_each_piece_buys", 9, 4.5)
-
-# ---- 6.8 the mechanism: model-implied ATM skew term structure -----------------
+# ---- 6.7 the mechanism: model-implied ATM skew term structure -----------------
 # ATM skew by central differences with h = SKEW_H, exactly as for the market
 # in PART 1.6, on a fine maturity grid that also goes below the shortest
 # traded maturity. The rate at a maturity between two traded ones is
@@ -1100,10 +943,10 @@ p_skew <- ggplot() +
   scale_x_continuous(trans = "log10", breaks = c(0.02, 0.05, 0.1, 0.25, 0.5, 1, 2)) +
   labs(x = "Maturity (years, log scale)", y = "ATM skew  dIV/dk at k = 0",
        title = "ATM skew term structure: market (points) and calibrated models (lines)")
-save_fig(p_skew, "fig11_atm_skew_models", 7.5, 4.5)
+save_fig(p_skew, "fig10_atm_skew_models", 7.5, 4.5)
 write.csv(skew_tab, file.path(OUT_DIR, "table_model_atm_skew.csv"), row.names = FALSE)
 
-# ---- 6.9 parameter distortion in Heston --------------------------------------
+# ---- 6.8 parameter distortion in Heston --------------------------------------
 # (i) Heston calibrated to all / only short / only long maturities.
 # (ii) The same five diffusion parameters inside SVJ and SVJJ.
 distortion <- rbind(
