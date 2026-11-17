@@ -658,21 +658,7 @@ print(round(fit_svjj$par, 4))
 # Distinct local optima found by the multi-start (identification of SVJJ)
 svjj_optima <- do.call(rbind, lapply(fit_svjj$runs, function(r)
   c(rmse_volpts = 100 * r$rmse, setNames(r$par, DPS_PAR))))
-cat("SVJJ optimum from each starting point:\n"); print(round(svjj_optima, 4))
 write.csv(svjj_optima, file.path(OUT_DIR, "table_svjj_local_optima.csv"), row.names = FALSE)
-
-# ---- 5.4 Heston on sub-surfaces ------------------------------------------------
-# If Heston were correctly specified, the parameters fitted to the short end
-# and to the long end would agree with each other and with the full fit.
-SHORT_MAX <- 0.30   # "short" = maturities up to this many years
-LONG_MIN  <- 0.90   # "long"  = maturities from this many years
-heston_sub <- function(d, start) {
-  m <- heston; m$starts <- c(list(start), heston$starts[1:2]); calibrate(m, d)
-}
-fit_heston_short <- cached("fit_heston_short_spot",
-                           heston_sub(train[train$tau <= SHORT_MAX, ], fit_heston$par))
-fit_heston_long  <- cached("fit_heston_long_spot",
-                           heston_sub(train[train$tau >= LONG_MIN, ], fit_heston$par))
 
 # ---- 5.5 evaluation on all quotes ------------------------------------------------
 res_heston <- evaluate_model(heston, fit_heston$par, opt)
@@ -729,7 +715,6 @@ summary_tab$n_eval_total    <- sapply(FITS, function(f) f$n_eval_total)
 summary_tab$time_best_start <- sapply(FITS, function(f) f$time_best)
 summary_tab$n_eval_best     <- sapply(FITS, function(f) f$n_eval_best)
 summary_tab$sec_per_surface <- sapply(model_levels, function(m) time_surface(MODELS[[m]], FITS[[m]]$par, train))
-cat("\nFit (IV-RMSE in vol points) and calibration speed:\n")
 print(as.data.frame(summary_tab), digits = 3, row.names = FALSE)
 write.csv(summary_tab, file.path(OUT_DIR, "table_summary.csv"), row.names = FALSE)
 
@@ -739,7 +724,6 @@ par_tab <- do.call(rbind, lapply(model_levels, function(m)
              lower = MODELS[[m]]$lower, upper = MODELS[[m]]$upper)))
 par_tab$at_bound <- with(par_tab, abs(value - lower) < 1e-6 * (1 + abs(lower)) |
                            abs(value - upper) < 1e-6 * (1 + abs(upper)))
-cat("\nCalibrated parameters:\n"); print(format(par_tab, digits = 4), row.names = FALSE)
 write.csv(par_tab, file.path(OUT_DIR, "table_parameters.csv"), row.names = FALSE)
 
 # ---- 6.4 errors by maturity and by moneyness ---------------------------------
@@ -748,7 +732,6 @@ by_mat <- res |>
   summarise(iv_err = rmse(iv_err), .groups = "drop") |>
   mutate(holdout = exdate %in% HOLDOUT_EXDATES)
 by_mat_wide <- pivot_wider(by_mat, id_cols = tau, names_from = model, values_from = iv_err)
-cat("\nIV-RMSE by maturity (vol points):\n")
 print(as.data.frame(by_mat_wide), digits = 3, row.names = FALSE)
 write.csv(by_mat_wide, file.path(OUT_DIR, "table_rmse_by_maturity.csv"), row.names = FALSE)
 
@@ -766,7 +749,6 @@ by_mny <- res |>
   group_by(model, mny_bucket) |>
   summarise(iv_err = rmse(iv_err), .groups = "drop")
 by_mny_wide <- pivot_wider(by_mny, names_from = model, values_from = iv_err)
-cat("\nIV-RMSE by moneyness bucket (vol points):\n")
 print(as.data.frame(by_mny_wide), digits = 3, row.names = FALSE)
 write.csv(by_mny_wide, file.path(OUT_DIR, "table_rmse_by_moneyness.csv"), row.names = FALSE)
 
@@ -873,7 +855,6 @@ distortion <- cbind(distortion,
                     feller   = 2 * distortion[, "kappa"] * distortion[, "theta"] / distortion[, "eta"]^2,
                     vol0     = sqrt(distortion[, "v0"]),
                     vol_long = sqrt(distortion[, "theta"]))
-cat("\nParameter distortion in Heston:\n"); print(round(distortion, 4))
 write.csv(distortion, file.path(OUT_DIR, "table_heston_distortion.csv"))
 
 # (iii) Cross-errors: how well does the Heston fitted on one end price the other?
@@ -883,7 +864,6 @@ cross <- sapply(list(all = fit_heston, short = fit_heston_short, long = fit_hest
                   c(short = rmse(r$iv_err[r$tau <= SHORT_MAX]), long = rmse(r$iv_err[r$tau >= LONG_MIN]),
                     all = rmse(r$iv_err))
                 })
-cat("\nHeston IV-RMSE (rows: evaluated on; columns: calibrated on):\n"); print(round(cross, 3))
 write.csv(cross, file.path(OUT_DIR, "table_heston_cross_errors.csv"))
 
 # (iv) Jump contribution to variance in SVJ / SVJJ (annualised, under Q)
@@ -891,6 +871,3 @@ jump_var <- c(
   SVJ  = unname(fit_svj$par["lambda"] * (fit_svj$par["mu_s"]^2 + fit_svj$par["sigma_s"]^2)),
   SVJJ = with(as.list(fit_svjj$par),      # E[(Z^s)^2] with Z^s | Z^v normal, Z^v exponential
               lambda * (sigma_s^2 + mu_s^2 + 2 * mu_s * rho_J * mu_v + 2 * rho_J^2 * mu_v^2)))
-cat("\nAnnualised variance from price jumps:\n"); print(round(jump_var, 5))
-
-cat("\nDone. Tables are in '", OUT_DIR, "', figures in '", FIG_DIR, "'.\n", sep = "")
