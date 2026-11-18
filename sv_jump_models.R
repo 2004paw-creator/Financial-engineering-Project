@@ -31,6 +31,8 @@ library(readxl)       # read the Excel file
 library(ggplot2)      # figures
 library(minpack.lm)   # Levenberg-Marquardt least squares (nls.lm)
 library(statmod)
+library(dplyr)        # group_by / summarise for the result tables
+library(tidyr)        # pivot_wider for the result tables
 
 DATA_FILE <- "Data20191113.xlsx"   # must be in the working directory
 OUT_DIR   <- "output"
@@ -42,7 +44,15 @@ set.seed(123)
 save_fig <- function(plot, name, width = 8, height = 5){
   ggsave(file.path(FIG_DIR, paste0(name, ".png")), plot, width = width, height = height, dpi = 300)
 }
-
+# Run a slow computation once and store the result in output/<name>.rds.
+# The next time the file is read instead. Delete the .rds file to recompute.
+cached <- function(name, expr){
+  file <- file.path(OUT_DIR, paste0(name, ".rds"))
+  if (file.exists(file)) return(readRDS(file))
+  value <- expr                     # expr is only evaluated here (lazy evaluation)
+  saveRDS(value, file)
+  value
+}
 theme_set(theme_bw(base_size = 11)) #sets the default theme for all plots
 
 
@@ -171,11 +181,13 @@ opt$k <- log(opt$K / S0)                      # log-moneyness
 #   (ii)  mid price at least MIN_MID (tick-size noise dominates below that)
 # -----------------------------------------------------------------------------
 MIN_MID <- 0.125
-
+MIN_K   <- -1      # drop far-wing quotes with k = log(K/S0) below this
 n_log <- c(raw = nrow(opt))
+opt <- opt[opt$bid > 0, ];                                       n_log["bid > 0"] <- nrow(opt)
 opt <- opt[(opt$cp == "P" & opt$K < S0) |
              (opt$cp == "C" & opt$K >= S0), ];                     n_log["OTM only"] <- nrow(opt)
 opt <- opt[opt$mid >= MIN_MID, ];                                n_log["mid >= min"] <- nrow(opt)
+opt <- opt[opt$k >= MIN_K, ];                                    n_log["k >= min"] <- nrow(opt)
 
 opt$iv <- implied_vol(opt$mid, S0, opt$K, opt$r, q_div, opt$tau, opt$cp)
 
@@ -659,6 +671,19 @@ print(round(fit_svjj$par, 4))
 svjj_optima <- do.call(rbind, lapply(fit_svjj$runs, function(r)
   c(rmse_volpts = 100 * r$rmse, setNames(r$par, DPS_PAR))))
 write.csv(svjj_optima, file.path(OUT_DIR, "table_svjj_local_optima.csv"), row.names = FALSE)
+
+# ---- 5.4 Heston on sub-surfaces ------------------------------------------------
+# If Heston were correctly specified, the parameters fitted to the short end
+# and to the long end would agree with each other and with the full fit.
+SHORT_MAX <- 0.30   # "short" = maturities up to this many years
+LONG_MIN  <- 0.90   # "long"  = maturities from this many years
+heston_sub <- function(d, start) {
+  m <- heston; m$starts <- c(list(start), heston$starts[1:2]); calibrate(m, d)
+}
+fit_heston_short <- cached("fit_heston_short_spot",
+                           heston_sub(train[train$tau <= SHORT_MAX, ], fit_heston$par))
+fit_heston_long  <- cached("fit_heston_long_spot",
+                           heston_sub(train[train$tau >= LONG_MIN, ], fit_heston$par))
 
 # ---- 5.5 evaluation on all quotes ------------------------------------------------
 res_heston <- evaluate_model(heston, fit_heston$par, opt)
