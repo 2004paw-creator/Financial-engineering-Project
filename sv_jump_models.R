@@ -189,7 +189,7 @@ opt <- opt[(opt$cp == "P" & opt$K < S0) |
 opt <- opt[opt$mid >= MIN_MID, ];                                n_log["mid >= min"] <- nrow(opt)
 opt <- opt[opt$k >= MIN_K, ];                                    n_log["k >= min"] <- nrow(opt)
 
-opt$iv <- implied_vol(opt$mid, S0, opt$K, opt$r, q_div, opt$tau, opt$cp)
+opt$iv <- implied_vol(opt$mid, S0, opt$K, opt$r, q_div, opt$tau, opt$cp) 
 
 #filters the option that are Far OUT of them money, because IV is very sensitive there, and the mistakes are very big
 #should we keep this or not
